@@ -69,19 +69,20 @@ col1, col2, col3, col4 = st.columns(4)
 
 with st.spinner("Loading pipeline metrics..."):
     try:
-        # Count active tasks from INFORMATION_SCHEMA
-        tasks_query = """
-        SELECT
-            COUNT(*) AS TOTAL_TASKS,
-            SUM(CASE WHEN STATE = 'started' THEN 1 ELSE 0 END) AS ACTIVE_TASKS,
-            SUM(CASE WHEN STATE = 'suspended' THEN 1 ELSE 0 END) AS SUSPENDED_TASKS
-        FROM INFORMATION_SCHEMA.TASKS
-        WHERE DELETED IS NULL
-        """
+        # Count active tasks using SHOW TASKS
         try:
+            # Execute SHOW TASKS and query the result
+            session.sql("SHOW TASKS").collect()
+            tasks_query = """
+            SELECT
+                COUNT(*) AS TOTAL_TASKS,
+                SUM(CASE WHEN "state" = 'started' THEN 1 ELSE 0 END) AS ACTIVE_TASKS,
+                SUM(CASE WHEN "state" = 'suspended' THEN 1 ELSE 0 END) AS SUSPENDED_TASKS
+            FROM TABLE(RESULT_SCAN(LAST_QUERY_ID()))
+            """
             task_counts = session.sql(tasks_query).to_pandas().iloc[0]
         except:
-            # Fallback if no tasks exist
+            # Fallback if no tasks exist or permission denied
             task_counts = {'TOTAL_TASKS': 0, 'ACTIVE_TASKS': 0, 'SUSPENDED_TASKS': 0}
 
         # Count Snowpipes
@@ -177,23 +178,24 @@ with tab1:
     st.markdown("### 📋 Task Monitoring")
 
     try:
-        # Task list from INFORMATION_SCHEMA
-        tasks_list_query = """
-        SELECT
-            TASK_CATALOG AS DATABASE_NAME,
-            TASK_SCHEMA AS SCHEMA_NAME,
-            TASK_NAME,
-            STATE,
-            SCHEDULE,
-            WAREHOUSE,
-            PREDECESSORS AS PREDECESSOR,
-            CREATED_ON AS CREATED,
-            LAST_SUSPENDED_ON AS LAST_COMMITTED_ON
-        FROM INFORMATION_SCHEMA.TASKS
-        WHERE DELETED_ON IS NULL
-        ORDER BY DATABASE_NAME, SCHEMA_NAME, TASK_NAME
-        """
+        # Task list using SHOW TASKS
         try:
+            # Execute SHOW TASKS and query the result
+            session.sql("SHOW TASKS").collect()
+            tasks_list_query = """
+            SELECT
+                "database_name" AS DATABASE_NAME,
+                "schema_name" AS SCHEMA_NAME,
+                "name" AS TASK_NAME,
+                "state" AS STATE,
+                "schedule" AS SCHEDULE,
+                COALESCE("warehouse", 'Serverless') AS WAREHOUSE,
+                "predecessors" AS PREDECESSOR,
+                "created_on" AS CREATED,
+                "last_committed_on" AS LAST_COMMITTED_ON
+            FROM TABLE(RESULT_SCAN(LAST_QUERY_ID()))
+            ORDER BY DATABASE_NAME, SCHEMA_NAME, TASK_NAME
+            """
             tasks_list = session.sql(tasks_list_query).to_pandas()
         except:
             # If no tasks or permission issue
