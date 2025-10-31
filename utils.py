@@ -225,7 +225,14 @@ class SnowflakeQueries:
     def get_warehouse_recommendations(_self, days):
         """Generate warehouse optimization recommendations"""
         query = f"""
-        WITH warehouse_stats AS (
+        WITH warehouse_base AS (
+            SELECT DISTINCT
+                WAREHOUSE_NAME,
+                WAREHOUSE_SIZE
+            FROM SNOWFLAKE.ACCOUNT_USAGE.WAREHOUSE_METERING_HISTORY
+            WHERE START_TIME >= DATEADD(DAY, -{days}, CURRENT_DATE())
+        ),
+        warehouse_stats AS (
             SELECT
                 w.WAREHOUSE_NAME,
                 w.WAREHOUSE_SIZE,
@@ -234,7 +241,7 @@ class SnowflakeQueries:
                 AVG(q.QUEUED_OVERLOAD_TIME)/1000 AS AVG_QUEUE_TIME_SEC,
                 SUM(m.CREDITS_USED) AS TOTAL_CREDITS,
                 AVG(l.AVG_RUNNING) AS AVG_CONCURRENT_QUERIES
-            FROM SNOWFLAKE.ACCOUNT_USAGE.WAREHOUSES w
+            FROM warehouse_base w
             LEFT JOIN SNOWFLAKE.ACCOUNT_USAGE.QUERY_HISTORY q
                 ON w.WAREHOUSE_NAME = q.WAREHOUSE_NAME
                 AND q.START_TIME >= DATEADD(DAY, -{days}, CURRENT_DATE())
@@ -244,7 +251,6 @@ class SnowflakeQueries:
             LEFT JOIN SNOWFLAKE.ACCOUNT_USAGE.WAREHOUSE_LOAD_HISTORY l
                 ON w.WAREHOUSE_NAME = l.WAREHOUSE_NAME
                 AND l.START_TIME >= DATEADD(DAY, -{days}, CURRENT_DATE())
-            WHERE w.DELETED IS NULL
             GROUP BY w.WAREHOUSE_NAME, w.WAREHOUSE_SIZE
         )
         SELECT
@@ -370,14 +376,13 @@ class SnowflakeQueries:
             queries['analyst'] = _self.session.sql(f"""
                 SELECT
                     DATE_TRUNC('DAY', START_TIME) AS USAGE_DATE,
-                    USER_NAME,
                     SEMANTIC_MODEL_NAME,
                     COUNT(*) AS REQUEST_COUNT,
                     AVG(CREDITS_USED) AS AVG_CREDITS,
                     SUM(CREDITS_USED) AS TOTAL_CREDITS
                 FROM SNOWFLAKE.ACCOUNT_USAGE.CORTEX_ANALYST_USAGE_HISTORY
                 WHERE START_TIME >= DATEADD(DAY, -{days}, CURRENT_DATE())
-                GROUP BY USAGE_DATE, USER_NAME, SEMANTIC_MODEL_NAME
+                GROUP BY USAGE_DATE, SEMANTIC_MODEL_NAME
                 ORDER BY USAGE_DATE DESC
             """).to_pandas()
         except:
@@ -389,8 +394,8 @@ class SnowflakeQueries:
                 SELECT
                     USAGE_DATE,
                     SERVICE_NAME,
-                    SUM(CREDITS_USED) AS TOTAL_CREDITS,
-                    SUM(NUM_QUERIES) AS TOTAL_QUERIES
+                    SUM(NUM_QUERIES) AS TOTAL_QUERIES,
+                    SUM(NUM_TOKENS) AS TOTAL_TOKENS
                 FROM SNOWFLAKE.ACCOUNT_USAGE.CORTEX_SEARCH_DAILY_USAGE_HISTORY
                 WHERE USAGE_DATE >= DATEADD(DAY, -{days}, CURRENT_DATE())
                 GROUP BY USAGE_DATE, SERVICE_NAME
@@ -531,9 +536,17 @@ class AIInsightsGenerator:
     def check_cortex_availability(self):
         """Check if Cortex Complete is available"""
         try:
-            result = self.session.sql("SELECT SYSTEM$CORTEX_AVAILABLE('COMPLETE')").collect()
-            return result[0][0] if result else False
-        except:
+            # Try to call Cortex Complete with a simple test
+            test_query = """
+            SELECT SNOWFLAKE.CORTEX.COMPLETE(
+                'mistral-7b',
+                'Test'
+            ) AS test_response
+            """
+            result = self.session.sql(test_query).collect()
+            return True
+        except Exception as e:
+            # Cortex not available or not authorized
             return False
 
     def generate_insight(self, context_data, insight_type="summary", custom_prompt=None):

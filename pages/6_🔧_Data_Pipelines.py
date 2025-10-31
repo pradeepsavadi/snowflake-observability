@@ -69,16 +69,20 @@ col1, col2, col3, col4 = st.columns(4)
 
 with st.spinner("Loading pipeline metrics..."):
     try:
-        # Count active tasks
+        # Count active tasks from INFORMATION_SCHEMA
         tasks_query = """
         SELECT
             COUNT(*) AS TOTAL_TASKS,
             SUM(CASE WHEN STATE = 'started' THEN 1 ELSE 0 END) AS ACTIVE_TASKS,
             SUM(CASE WHEN STATE = 'suspended' THEN 1 ELSE 0 END) AS SUSPENDED_TASKS
-        FROM SNOWFLAKE.ACCOUNT_USAGE.TASKS
+        FROM INFORMATION_SCHEMA.TASKS
         WHERE DELETED IS NULL
         """
-        task_counts = session.sql(tasks_query).to_pandas().iloc[0]
+        try:
+            task_counts = session.sql(tasks_query).to_pandas().iloc[0]
+        except:
+            # Fallback if no tasks exist
+            task_counts = {'TOTAL_TASKS': 0, 'ACTIVE_TASKS': 0, 'SUSPENDED_TASKS': 0}
 
         # Count Snowpipes
         pipes_query = """
@@ -173,23 +177,27 @@ with tab1:
     st.markdown("### 📋 Task Monitoring")
 
     try:
-        # Task list
+        # Task list from INFORMATION_SCHEMA
         tasks_list_query = """
         SELECT
-            DATABASE_NAME,
-            SCHEMA_NAME,
-            NAME AS TASK_NAME,
+            TASK_CATALOG AS DATABASE_NAME,
+            TASK_SCHEMA AS SCHEMA_NAME,
+            TASK_NAME,
             STATE,
             SCHEDULE,
             WAREHOUSE,
-            PREDECESSOR,
-            CREATED,
-            LAST_COMMITTED_ON
-        FROM SNOWFLAKE.ACCOUNT_USAGE.TASKS
-        WHERE DELETED IS NULL
-        ORDER BY DATABASE_NAME, SCHEMA_NAME, NAME
+            PREDECESSORS AS PREDECESSOR,
+            CREATED_ON AS CREATED,
+            LAST_SUSPENDED_ON AS LAST_COMMITTED_ON
+        FROM INFORMATION_SCHEMA.TASKS
+        WHERE DELETED_ON IS NULL
+        ORDER BY DATABASE_NAME, SCHEMA_NAME, TASK_NAME
         """
-        tasks_list = session.sql(tasks_list_query).to_pandas()
+        try:
+            tasks_list = session.sql(tasks_list_query).to_pandas()
+        except:
+            # If no tasks or permission issue
+            tasks_list = pd.DataFrame()
 
         if not tasks_list.empty:
             tasks_list['CREATED'] = pd.to_datetime(tasks_list['CREATED'])
