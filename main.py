@@ -72,27 +72,42 @@ with st.sidebar:
     st.markdown("### 📈 Quick Stats")
 
     try:
-        quick_stats_query = f"""
-        SELECT
-            (SELECT COUNT(DISTINCT WAREHOUSE_NAME)
-             FROM SNOWFLAKE.ACCOUNT_USAGE.WAREHOUSES
-             WHERE DELETED IS NULL) AS ACTIVE_WAREHOUSES,
-            (SELECT COUNT(DISTINCT DATABASE_NAME)
-             FROM SNOWFLAKE.ACCOUNT_USAGE.DATABASES
-             WHERE DELETED IS NULL) AS ACTIVE_DATABASES,
-            (SELECT COUNT(DISTINCT USER_NAME)
-             FROM SNOWFLAKE.ACCOUNT_USAGE.USERS
-             WHERE DELETED_ON IS NULL) AS ACTIVE_USERS,
-            (SELECT SUM(CREDITS_USED)
-             FROM SNOWFLAKE.ACCOUNT_USAGE.METERING_HISTORY
-             WHERE START_TIME >= DATEADD(DAY, -{time_period}, CURRENT_DATE())) AS TOTAL_CREDITS
+        # Get warehouses count from WAREHOUSE_METERING_HISTORY
+        wh_count_query = """
+        SELECT COUNT(DISTINCT WAREHOUSE_NAME) AS ACTIVE_WAREHOUSES
+        FROM SNOWFLAKE.ACCOUNT_USAGE.WAREHOUSE_METERING_HISTORY
+        WHERE START_TIME >= DATEADD(DAY, -7, CURRENT_DATE())
         """
-        quick_stats = session.sql(quick_stats_query).to_pandas().iloc[0]
+        wh_count = session.sql(wh_count_query).to_pandas()['ACTIVE_WAREHOUSES'].iloc[0]
 
-        st.metric("Active Warehouses", int(quick_stats['ACTIVE_WAREHOUSES']))
-        st.metric("Active Databases", int(quick_stats['ACTIVE_DATABASES']))
-        st.metric("Active Users", int(quick_stats['ACTIVE_USERS']))
-        st.metric("Total Credits", f"{quick_stats['TOTAL_CREDITS']:.1f}")
+        # Get databases count
+        db_count_query = """
+        SELECT COUNT(DISTINCT DATABASE_NAME) AS ACTIVE_DATABASES
+        FROM SNOWFLAKE.ACCOUNT_USAGE.DATABASES
+        WHERE DELETED IS NULL
+        """
+        db_count = session.sql(db_count_query).to_pandas()['ACTIVE_DATABASES'].iloc[0]
+
+        # Get users count
+        user_count_query = """
+        SELECT COUNT(DISTINCT NAME) AS ACTIVE_USERS
+        FROM SNOWFLAKE.ACCOUNT_USAGE.USERS
+        WHERE DELETED_ON IS NULL
+        """
+        user_count = session.sql(user_count_query).to_pandas()['ACTIVE_USERS'].iloc[0]
+
+        # Get total credits
+        credits_query = f"""
+        SELECT SUM(CREDITS_USED) AS TOTAL_CREDITS
+        FROM SNOWFLAKE.ACCOUNT_USAGE.METERING_HISTORY
+        WHERE START_TIME >= DATEADD(DAY, -{time_period}, CURRENT_DATE())
+        """
+        total_credits = session.sql(credits_query).to_pandas()['TOTAL_CREDITS'].iloc[0]
+
+        st.metric("Active Warehouses", int(wh_count))
+        st.metric("Active Databases", int(db_count))
+        st.metric("Active Users", int(user_count))
+        st.metric("Total Credits", f"{total_credits:.1f}")
     except Exception as e:
         st.sidebar.error(f"Error loading quick stats: {str(e)}")
 

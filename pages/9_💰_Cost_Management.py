@@ -796,20 +796,32 @@ with tab4:
 
             # 1. Idle warehouse savings
             idle_wh_query = f"""
-            WITH warehouse_stats AS (
+            WITH warehouse_load AS (
                 SELECT
                     WAREHOUSE_NAME,
-                    SUM(CREDITS_USED) AS TOTAL_CREDITS,
-                    SUM(CREDITS_USED) * {credit_cost} AS TOTAL_COST,
                     AVG(AVG_RUNNING) AS AVG_RUNNING,
                     AVG(AVG_QUEUED_LOAD) AS AVG_QUEUED
                 FROM SNOWFLAKE.ACCOUNT_USAGE.WAREHOUSE_LOAD_HISTORY
                 WHERE START_TIME >= DATEADD(DAY, -{time_period}, CURRENT_DATE())
                 GROUP BY WAREHOUSE_NAME
+            ),
+            warehouse_credits AS (
+                SELECT
+                    WAREHOUSE_NAME,
+                    SUM(CREDITS_USED) AS TOTAL_CREDITS
+                FROM SNOWFLAKE.ACCOUNT_USAGE.WAREHOUSE_METERING_HISTORY
+                WHERE START_TIME >= DATEADD(DAY, -{time_period}, CURRENT_DATE())
+                GROUP BY WAREHOUSE_NAME
             )
-            SELECT *
-            FROM warehouse_stats
-            WHERE AVG_RUNNING < 1 AND TOTAL_CREDITS > 1
+            SELECT
+                c.WAREHOUSE_NAME,
+                c.TOTAL_CREDITS,
+                c.TOTAL_CREDITS * {credit_cost} AS TOTAL_COST,
+                l.AVG_RUNNING,
+                l.AVG_QUEUED
+            FROM warehouse_credits c
+            JOIN warehouse_load l ON c.WAREHOUSE_NAME = l.WAREHOUSE_NAME
+            WHERE l.AVG_RUNNING < 1 AND c.TOTAL_CREDITS > 1
             ORDER BY TOTAL_COST DESC
             """
             idle_warehouses = session.sql(idle_wh_query).to_pandas()
@@ -887,15 +899,30 @@ with tab4:
 
             # 5. Warehouse scaling
             oversized_wh_query = f"""
+            WITH warehouse_load AS (
+                SELECT
+                    WAREHOUSE_NAME,
+                    AVG(AVG_QUEUED_LOAD) AS AVG_QUEUED
+                FROM SNOWFLAKE.ACCOUNT_USAGE.WAREHOUSE_LOAD_HISTORY
+                WHERE START_TIME >= DATEADD(DAY, -{time_period}, CURRENT_DATE())
+                GROUP BY WAREHOUSE_NAME
+            ),
+            warehouse_credits AS (
+                SELECT
+                    WAREHOUSE_NAME,
+                    SUM(CREDITS_USED) AS TOTAL_CREDITS
+                FROM SNOWFLAKE.ACCOUNT_USAGE.WAREHOUSE_METERING_HISTORY
+                WHERE START_TIME >= DATEADD(DAY, -{time_period}, CURRENT_DATE())
+                GROUP BY WAREHOUSE_NAME
+            )
             SELECT
-                WAREHOUSE_NAME,
-                SUM(CREDITS_USED) * {credit_cost} AS TOTAL_COST,
-                AVG(AVG_QUEUED_LOAD) AS AVG_QUEUED
-            FROM SNOWFLAKE.ACCOUNT_USAGE.WAREHOUSE_LOAD_HISTORY
-            WHERE START_TIME >= DATEADD(DAY, -{time_period}, CURRENT_DATE())
-            GROUP BY WAREHOUSE_NAME
-            HAVING AVG(AVG_QUEUED_LOAD) < 0.1
-            AND SUM(CREDITS_USED) > 10
+                c.WAREHOUSE_NAME,
+                c.TOTAL_CREDITS * {credit_cost} AS TOTAL_COST,
+                l.AVG_QUEUED
+            FROM warehouse_credits c
+            JOIN warehouse_load l ON c.WAREHOUSE_NAME = l.WAREHOUSE_NAME
+            WHERE l.AVG_QUEUED < 0.1
+            AND c.TOTAL_CREDITS > 10
             ORDER BY TOTAL_COST DESC
             """
             oversized_wh = session.sql(oversized_wh_query).to_pandas()

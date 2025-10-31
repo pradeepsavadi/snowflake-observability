@@ -644,6 +644,7 @@ with tab3:
         st.markdown("---")
         st.markdown("#### Object Privileges")
 
+        # Use GRANTS_TO_ROLES for table privileges
         object_privileges_query = """
         SELECT
             GRANTEE_NAME,
@@ -652,8 +653,10 @@ with tab3:
             TABLE_SCHEMA AS SCHEMA_NAME,
             TABLE_NAME,
             GRANTED_BY
-        FROM SNOWFLAKE.ACCOUNT_USAGE.TABLE_PRIVILEGES
-        WHERE DELETED_ON IS NULL
+        FROM SNOWFLAKE.ACCOUNT_USAGE.GRANTS_TO_ROLES
+        WHERE GRANTED_ON = 'TABLE'
+        AND DELETED_ON IS NULL
+        AND TABLE_NAME IS NOT NULL
         ORDER BY GRANTEE_NAME, TABLE_CATALOG, TABLE_SCHEMA, TABLE_NAME
         LIMIT 500
         """

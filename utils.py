@@ -190,8 +190,8 @@ class SnowflakeQueries:
             SELECT
                 WAREHOUSE_NAME,
                 SUM(CREDITS_USED) AS TOTAL_CREDITS,
-                AVG(CREDITS_USED) AS AVG_DAILY_CREDITS,
-                MAX(CREDITS_USED) AS MAX_DAILY_CREDITS,
+                SUM(CREDITS_USED) / {days} AS AVG_DAILY_CREDITS,
+                MAX(CREDITS_USED) AS MAX_HOURLY_CREDITS,
                 COUNT(DISTINCT DATE_TRUNC('DAY', START_TIME)) AS ACTIVE_DAYS
             FROM SNOWFLAKE.ACCOUNT_USAGE.WAREHOUSE_METERING_HISTORY
             WHERE START_TIME >= DATEADD(DAY, -{days}, CURRENT_DATE())
@@ -225,7 +225,14 @@ class SnowflakeQueries:
     def get_warehouse_recommendations(_self, days):
         """Generate warehouse optimization recommendations"""
         query = f"""
-        WITH warehouse_stats AS (
+        WITH warehouse_base AS (
+            SELECT DISTINCT
+                WAREHOUSE_NAME,
+                WAREHOUSE_SIZE
+            FROM SNOWFLAKE.ACCOUNT_USAGE.WAREHOUSE_METERING_HISTORY
+            WHERE START_TIME >= DATEADD(DAY, -{days}, CURRENT_DATE())
+        ),
+        warehouse_stats AS (
             SELECT
                 w.WAREHOUSE_NAME,
                 w.WAREHOUSE_SIZE,
@@ -234,7 +241,7 @@ class SnowflakeQueries:
                 AVG(q.QUEUED_OVERLOAD_TIME)/1000 AS AVG_QUEUE_TIME_SEC,
                 SUM(m.CREDITS_USED) AS TOTAL_CREDITS,
                 AVG(l.AVG_RUNNING) AS AVG_CONCURRENT_QUERIES
-            FROM SNOWFLAKE.ACCOUNT_USAGE.WAREHOUSES w
+            FROM warehouse_base w
             LEFT JOIN SNOWFLAKE.ACCOUNT_USAGE.QUERY_HISTORY q
                 ON w.WAREHOUSE_NAME = q.WAREHOUSE_NAME
                 AND q.START_TIME >= DATEADD(DAY, -{days}, CURRENT_DATE())
@@ -244,7 +251,6 @@ class SnowflakeQueries:
             LEFT JOIN SNOWFLAKE.ACCOUNT_USAGE.WAREHOUSE_LOAD_HISTORY l
                 ON w.WAREHOUSE_NAME = l.WAREHOUSE_NAME
                 AND l.START_TIME >= DATEADD(DAY, -{days}, CURRENT_DATE())
-            WHERE w.DELETED IS NULL
             GROUP BY w.WAREHOUSE_NAME, w.WAREHOUSE_SIZE
         )
         SELECT
@@ -295,10 +301,10 @@ class SnowflakeQueries:
         SELECT
             l.*,
             s.TOTAL_STAGE_BYTES,
-            (l.DATABASE_BYTES + l.FAILSAFE_BYTES + l.HYBRID_TABLE_BYTES) AS TOTAL_BYTES
+            (l.DATABASE_BYTES + l.FAILSAFE_BYTES + l.HYBRID_TABLE_BYTES) AS TOTAL_DATABASE_BYTES
         FROM latest_storage l
         CROSS JOIN stage_storage s
-        ORDER BY TOTAL_BYTES DESC
+        ORDER BY TOTAL_DATABASE_BYTES DESC
         """
         return _self.session.sql(query).to_pandas()
 
@@ -321,6 +327,14 @@ class SnowflakeQueries:
                 DELETED
             FROM SNOWFLAKE.ACCOUNT_USAGE.TABLE_STORAGE_METRICS
         ),
+        accessed_tables AS (
+            SELECT DISTINCT
+                f.value:objectName::STRING AS FULL_TABLE_NAME
+            FROM SNOWFLAKE.ACCOUNT_USAGE.ACCESS_HISTORY a,
+                 LATERAL FLATTEN(input => a.BASE_OBJECTS_ACCESSED) f
+            WHERE a.QUERY_START_TIME >= DATEADD(DAY, -90, CURRENT_DATE())
+                AND f.value:objectDomain::STRING = 'Table'
+        ),
         unused_tables AS (
             SELECT
                 t.DATABASE_NAME,
@@ -329,10 +343,9 @@ class SnowflakeQueries:
                 t.TOTAL_BYTES,
                 'No queries in 90 days' AS ISSUE
             FROM table_metrics t
-            LEFT JOIN SNOWFLAKE.ACCOUNT_USAGE.ACCESS_HISTORY a
-                ON CONTAINS(a.BASE_OBJECTS_ACCESSED[0]:objectName::STRING, t.TABLE_NAME)
-                AND a.QUERY_START_TIME >= DATEADD(DAY, -90, CURRENT_DATE())
-            WHERE a.QUERY_ID IS NULL
+            LEFT JOIN accessed_tables a
+                ON a.FULL_TABLE_NAME = CONCAT(t.DATABASE_NAME, '.', t.SCHEMA_NAME, '.', t.TABLE_NAME)
+            WHERE a.FULL_TABLE_NAME IS NULL
                 AND t.DELETED = FALSE
                 AND t.TOTAL_BYTES > 1073741824
         ),
@@ -370,14 +383,13 @@ class SnowflakeQueries:
             queries['analyst'] = _self.session.sql(f"""
                 SELECT
                     DATE_TRUNC('DAY', START_TIME) AS USAGE_DATE,
-                    USER_NAME,
                     SEMANTIC_MODEL_NAME,
                     COUNT(*) AS REQUEST_COUNT,
                     AVG(CREDITS_USED) AS AVG_CREDITS,
                     SUM(CREDITS_USED) AS TOTAL_CREDITS
                 FROM SNOWFLAKE.ACCOUNT_USAGE.CORTEX_ANALYST_USAGE_HISTORY
                 WHERE START_TIME >= DATEADD(DAY, -{days}, CURRENT_DATE())
-                GROUP BY USAGE_DATE, USER_NAME, SEMANTIC_MODEL_NAME
+                GROUP BY USAGE_DATE, SEMANTIC_MODEL_NAME
                 ORDER BY USAGE_DATE DESC
             """).to_pandas()
         except:
@@ -389,8 +401,8 @@ class SnowflakeQueries:
                 SELECT
                     USAGE_DATE,
                     SERVICE_NAME,
-                    SUM(CREDITS_USED) AS TOTAL_CREDITS,
-                    SUM(NUM_QUERIES) AS TOTAL_QUERIES
+                    SUM(NUM_QUERIES) AS TOTAL_QUERIES,
+                    SUM(NUM_TOKENS) AS TOTAL_TOKENS
                 FROM SNOWFLAKE.ACCOUNT_USAGE.CORTEX_SEARCH_DAILY_USAGE_HISTORY
                 WHERE USAGE_DATE >= DATEADD(DAY, -{days}, CURRENT_DATE())
                 GROUP BY USAGE_DATE, SERVICE_NAME
@@ -485,30 +497,352 @@ class SnowflakeQueries:
         problematic_queries AS (
             SELECT
                 *,
-                CASE
-                    WHEN ELAPSED_SEC > 300 THEN 'Long running (>5 min)'
-                    WHEN QUEUED_SEC > 60 THEN 'High queue time'
-                    WHEN BYTES_SPILLED_TO_REMOTE_STORAGE > 0 THEN 'Remote spilling'
-                    WHEN BYTES_SPILLED_TO_LOCAL_STORAGE > 1073741824 THEN 'Excessive local spilling'
-                    WHEN COMPILATION_SEC / NULLIF(ELAPSED_SEC, 0) > 0.3 THEN 'High compilation overhead'
-                    WHEN EXECUTION_STATUS != 'SUCCESS' THEN 'Query failed'
-                    WHEN BYTES_SCANNED > 10737418240 THEN 'Excessive data scan (>10GB)'
-                    ELSE 'Other'
-                END AS ISSUE_TYPE
+                ARRAY_CONSTRUCT_COMPACT(
+                    IFF(ELAPSED_SEC > 300, 'Long running (>5 min)', NULL),
+                    IFF(QUEUED_SEC > 60, 'High queue time', NULL),
+                    IFF(BYTES_SPILLED_TO_REMOTE_STORAGE > 0, 'Remote spilling', NULL),
+                    IFF(BYTES_SPILLED_TO_LOCAL_STORAGE > 1073741824, 'Excessive local spilling', NULL),
+                    IFF(COMPILATION_SEC / NULLIF(ELAPSED_SEC, 0) > 0.3, 'High compilation overhead', NULL),
+                    IFF(EXECUTION_STATUS != 'SUCCESS', 'Query failed', NULL),
+                    IFF(BYTES_SCANNED > 10737418240, 'Excessive data scan (>10GB)', NULL),
+                    IFF(PARTITIONS_SCANNED / NULLIF(PARTITIONS_TOTAL, 0) > 0.8 AND PARTITIONS_TOTAL > 100, 'Poor partition pruning', NULL)
+                ) AS ISSUES,
+                ARRAY_SIZE(
+                    ARRAY_CONSTRUCT_COMPACT(
+                        IFF(ELAPSED_SEC > 300, 1, NULL),
+                        IFF(QUEUED_SEC > 60, 1, NULL),
+                        IFF(BYTES_SPILLED_TO_REMOTE_STORAGE > 0, 1, NULL),
+                        IFF(BYTES_SPILLED_TO_LOCAL_STORAGE > 1073741824, 1, NULL),
+                        IFF(COMPILATION_SEC / NULLIF(ELAPSED_SEC, 0) > 0.3, 1, NULL),
+                        IFF(EXECUTION_STATUS != 'SUCCESS', 1, NULL),
+                        IFF(BYTES_SCANNED > 10737418240, 1, NULL),
+                        IFF(PARTITIONS_SCANNED / NULLIF(PARTITIONS_TOTAL, 0) > 0.8 AND PARTITIONS_TOTAL > 100, 1, NULL)
+                    )
+                ) AS ISSUE_COUNT
             FROM query_metrics
             WHERE ELAPSED_SEC > 60
                 OR QUEUED_SEC > 10
                 OR BYTES_SPILLED_TO_REMOTE_STORAGE > 0
+                OR BYTES_SPILLED_TO_LOCAL_STORAGE > 1073741824
+                OR COMPILATION_SEC / NULLIF(ELAPSED_SEC, 0) > 0.3
                 OR EXECUTION_STATUS != 'SUCCESS'
+                OR BYTES_SCANNED > 10737418240
+                OR (PARTITIONS_SCANNED / NULLIF(PARTITIONS_TOTAL, 0) > 0.8 AND PARTITIONS_TOTAL > 100)
+        ),
+        issue_summary AS (
+            SELECT
+                f.value::STRING AS ISSUE_TYPE,
+                COUNT(*) AS QUERY_COUNT,
+                AVG(p.ELAPSED_SEC) AS AVG_ELAPSED_SEC,
+                SUM(p.BYTES_SCANNED) AS TOTAL_BYTES_SCANNED
+            FROM problematic_queries p,
+                 LATERAL FLATTEN(input => p.ISSUES) f
+            GROUP BY ISSUE_TYPE
         )
-        SELECT
-            ISSUE_TYPE,
-            COUNT(*) AS QUERY_COUNT,
-            AVG(ELAPSED_SEC) AS AVG_ELAPSED_SEC,
-            SUM(BYTES_SCANNED) AS TOTAL_BYTES_SCANNED
-        FROM problematic_queries
-        GROUP BY ISSUE_TYPE
+        SELECT *
+        FROM issue_summary
         ORDER BY QUERY_COUNT DESC
+        """
+        return _self.session.sql(query).to_pandas()
+
+    # -------------------------------------------------------------------------
+    # AUTOMATIC CLUSTERING & MATERIALIZED VIEWS
+    # -------------------------------------------------------------------------
+
+    @st.cache_data(ttl=3600)
+    def get_automatic_clustering_history(_self, days):
+        """Monitor automatic clustering costs and efficiency"""
+        query = f"""
+        SELECT
+            TABLE_NAME,
+            DATABASE_NAME,
+            SCHEMA_NAME,
+            DATE_TRUNC('DAY', START_TIME) AS CLUSTER_DATE,
+            SUM(CREDITS_USED) AS TOTAL_CREDITS,
+            SUM(NUM_BYTES_RECLUSTERED) AS BYTES_RECLUSTERED,
+            SUM(NUM_ROWS_RECLUSTERED) AS ROWS_RECLUSTERED,
+            COUNT(*) AS RECLUSTERING_RUNS
+        FROM SNOWFLAKE.ACCOUNT_USAGE.AUTOMATIC_CLUSTERING_HISTORY
+        WHERE START_TIME >= DATEADD(DAY, -{days}, CURRENT_DATE())
+        GROUP BY TABLE_NAME, DATABASE_NAME, SCHEMA_NAME, CLUSTER_DATE
+        ORDER BY TOTAL_CREDITS DESC
+        LIMIT 100
+        """
+        return _self.session.sql(query).to_pandas()
+
+    @st.cache_data(ttl=3600)
+    def get_materialized_view_refresh_history(_self, days):
+        """Monitor materialized view refresh costs and performance"""
+        query = f"""
+        SELECT
+            NAME AS VIEW_NAME,
+            DATABASE_NAME,
+            SCHEMA_NAME,
+            DATE_TRUNC('DAY', START_TIME) AS REFRESH_DATE,
+            COUNT(*) AS REFRESH_COUNT,
+            SUM(CREDITS_USED) AS TOTAL_CREDITS,
+            AVG(CREDITS_USED) AS AVG_CREDITS_PER_REFRESH,
+            AVG(DATEDIFF('SECOND', START_TIME, END_TIME)) AS AVG_DURATION_SEC,
+            SUM(BYTES_WRITTEN) AS TOTAL_BYTES_WRITTEN
+        FROM SNOWFLAKE.ACCOUNT_USAGE.MATERIALIZED_VIEW_REFRESH_HISTORY
+        WHERE START_TIME >= DATEADD(DAY, -{days}, CURRENT_DATE())
+        GROUP BY NAME, DATABASE_NAME, SCHEMA_NAME, REFRESH_DATE
+        ORDER BY TOTAL_CREDITS DESC
+        LIMIT 100
+        """
+        return _self.session.sql(query).to_pandas()
+
+    # -------------------------------------------------------------------------
+    # DATA LOADING & COPY HISTORY
+    # -------------------------------------------------------------------------
+
+    @st.cache_data(ttl=3600)
+    def get_copy_history(_self, days):
+        """Monitor COPY INTO command history and performance"""
+        query = f"""
+        SELECT
+            DATE_TRUNC('DAY', LAST_LOAD_TIME) AS LOAD_DATE,
+            TABLE_NAME,
+            TABLE_CATALOG_NAME AS DATABASE_NAME,
+            TABLE_SCHEMA_NAME AS SCHEMA_NAME,
+            COUNT(DISTINCT FILE_NAME) AS FILES_LOADED,
+            SUM(ROW_COUNT) AS TOTAL_ROWS,
+            SUM(ROW_PARSED) AS TOTAL_ROWS_PARSED,
+            SUM(FILE_SIZE) AS TOTAL_FILE_SIZE_BYTES,
+            SUM(CASE WHEN STATUS = 'LOADED' THEN 1 ELSE 0 END) AS SUCCESSFUL_LOADS,
+            SUM(CASE WHEN STATUS != 'LOADED' THEN 1 ELSE 0 END) AS FAILED_LOADS
+        FROM SNOWFLAKE.ACCOUNT_USAGE.COPY_HISTORY
+        WHERE LAST_LOAD_TIME >= DATEADD(DAY, -{days}, CURRENT_DATE())
+        GROUP BY LOAD_DATE, TABLE_NAME, DATABASE_NAME, SCHEMA_NAME
+        ORDER BY TOTAL_ROWS DESC
+        LIMIT 100
+        """
+        return _self.session.sql(query).to_pandas()
+
+    @st.cache_data(ttl=3600)
+    def get_load_history(_self, days):
+        """Monitor Snowpipe and bulk load history"""
+        query = f"""
+        SELECT
+            DATE_TRUNC('DAY', LAST_LOAD_TIME) AS LOAD_DATE,
+            TABLE_NAME,
+            CATALOG_NAME AS DATABASE_NAME,
+            SCHEMA_NAME,
+            PIPE_NAME,
+            COUNT(*) AS LOAD_EVENTS,
+            SUM(ROW_COUNT) AS TOTAL_ROWS,
+            SUM(FILE_SIZE) AS TOTAL_FILE_SIZE_BYTES,
+            SUM(CASE WHEN STATUS = 'LOADED' THEN 1 ELSE 0 END) AS SUCCESSFUL,
+            SUM(CASE WHEN STATUS != 'LOADED' THEN 1 ELSE 0 END) AS FAILED
+        FROM SNOWFLAKE.ACCOUNT_USAGE.LOAD_HISTORY
+        WHERE LAST_LOAD_TIME >= DATEADD(DAY, -{days}, CURRENT_DATE())
+        GROUP BY LOAD_DATE, TABLE_NAME, DATABASE_NAME, SCHEMA_NAME, PIPE_NAME
+        ORDER BY TOTAL_ROWS DESC
+        LIMIT 100
+        """
+        return _self.session.sql(query).to_pandas()
+
+    # -------------------------------------------------------------------------
+    # SEARCH OPTIMIZATION & REPLICATION
+    # -------------------------------------------------------------------------
+
+    @st.cache_data(ttl=3600)
+    def get_search_optimization_history(_self, days):
+        """Monitor search optimization service costs"""
+        query = f"""
+        SELECT
+            DATE_TRUNC('DAY', START_TIME) AS OPTIMIZATION_DATE,
+            TABLE_NAME,
+            DATABASE_NAME,
+            SCHEMA_NAME,
+            SUM(CREDITS_USED) AS TOTAL_CREDITS,
+            COUNT(*) AS OPTIMIZATION_RUNS,
+            AVG(CREDITS_USED) AS AVG_CREDITS_PER_RUN
+        FROM SNOWFLAKE.ACCOUNT_USAGE.SEARCH_OPTIMIZATION_HISTORY
+        WHERE START_TIME >= DATEADD(DAY, -{days}, CURRENT_DATE())
+        GROUP BY OPTIMIZATION_DATE, TABLE_NAME, DATABASE_NAME, SCHEMA_NAME
+        ORDER BY TOTAL_CREDITS DESC
+        LIMIT 100
+        """
+        return _self.session.sql(query).to_pandas()
+
+    @st.cache_data(ttl=3600)
+    def get_replication_usage_history(_self, days):
+        """Monitor replication and failover group usage"""
+        query = f"""
+        SELECT
+            DATE_TRUNC('DAY', START_TIME) AS REPLICATION_DATE,
+            REPLICATION_GROUP_NAME,
+            DATABASE_NAME,
+            SUM(CREDITS_USED) AS TOTAL_CREDITS,
+            SUM(BYTES_TRANSFERRED) AS TOTAL_BYTES_TRANSFERRED,
+            COUNT(*) AS REPLICATION_RUNS
+        FROM SNOWFLAKE.ACCOUNT_USAGE.REPLICATION_USAGE_HISTORY
+        WHERE START_TIME >= DATEADD(DAY, -{days}, CURRENT_DATE())
+        GROUP BY REPLICATION_DATE, REPLICATION_GROUP_NAME, DATABASE_NAME
+        ORDER BY TOTAL_CREDITS DESC
+        LIMIT 100
+        """
+        return _self.session.sql(query).to_pandas()
+
+    # -------------------------------------------------------------------------
+    # DATA GOVERNANCE & METADATA
+    # -------------------------------------------------------------------------
+
+    @st.cache_data(ttl=3600)
+    def get_tag_references(_self):
+        """Get tag usage across objects for governance tracking"""
+        query = """
+        SELECT
+            TAG_DATABASE,
+            TAG_SCHEMA,
+            TAG_NAME,
+            DOMAIN AS OBJECT_TYPE,
+            COUNT(*) AS TAGGED_OBJECTS,
+            COUNT(DISTINCT OBJECT_DATABASE || '.' || OBJECT_SCHEMA) AS SCHEMAS_WITH_TAGS
+        FROM SNOWFLAKE.ACCOUNT_USAGE.TAG_REFERENCES
+        WHERE TAG_DELETED IS NULL
+            AND OBJECT_DELETED IS NULL
+        GROUP BY TAG_DATABASE, TAG_SCHEMA, TAG_NAME, DOMAIN
+        ORDER BY TAGGED_OBJECTS DESC
+        LIMIT 100
+        """
+        return _self.session.sql(query).to_pandas()
+
+    @st.cache_data(ttl=3600)
+    def get_object_dependencies(_self):
+        """Analyze object dependencies for impact analysis"""
+        query = """
+        SELECT
+            REFERENCED_DATABASE,
+            REFERENCED_SCHEMA,
+            REFERENCED_OBJECT_NAME,
+            REFERENCED_OBJECT_DOMAIN AS REFERENCED_TYPE,
+            COUNT(DISTINCT REFERENCING_OBJECT_NAME) AS DEPENDENT_OBJECTS,
+            COUNT(DISTINCT REFERENCING_OBJECT_DOMAIN) AS DEPENDENT_TYPES,
+            ARRAY_AGG(DISTINCT REFERENCING_OBJECT_DOMAIN) AS DEPENDENT_OBJECT_TYPES
+        FROM SNOWFLAKE.ACCOUNT_USAGE.OBJECT_DEPENDENCIES
+        WHERE REFERENCED_OBJECT_DELETED IS NULL
+            AND REFERENCING_OBJECT_DELETED IS NULL
+        GROUP BY REFERENCED_DATABASE, REFERENCED_SCHEMA, REFERENCED_OBJECT_NAME, REFERENCED_TYPE
+        HAVING COUNT(DISTINCT REFERENCING_OBJECT_NAME) > 1
+        ORDER BY DEPENDENT_OBJECTS DESC
+        LIMIT 100
+        """
+        return _self.session.sql(query).to_pandas()
+
+    @st.cache_data(ttl=3600)
+    def get_policy_references(_self):
+        """Monitor security policy assignments"""
+        query = """
+        SELECT
+            POLICY_NAME,
+            POLICY_KIND,
+            POLICY_DB AS POLICY_DATABASE,
+            POLICY_SCHEMA,
+            REF_ENTITY_DOMAIN AS PROTECTED_OBJECT_TYPE,
+            COUNT(*) AS OBJECTS_PROTECTED,
+            COUNT(DISTINCT REF_DATABASE_NAME || '.' || REF_SCHEMA_NAME) AS SCHEMAS_PROTECTED
+        FROM SNOWFLAKE.ACCOUNT_USAGE.POLICY_REFERENCES
+        WHERE POLICY_STATUS = 'ACTIVE'
+        GROUP BY POLICY_NAME, POLICY_KIND, POLICY_DATABASE, POLICY_SCHEMA, PROTECTED_OBJECT_TYPE
+        ORDER BY OBJECTS_PROTECTED DESC
+        """
+        return _self.session.sql(query).to_pandas()
+
+    # -------------------------------------------------------------------------
+    # FUNCTIONS & PROCEDURES
+    # -------------------------------------------------------------------------
+
+    @st.cache_data(ttl=3600)
+    def get_functions_inventory(_self):
+        """Get inventory of user-defined functions"""
+        query = """
+        SELECT
+            FUNCTION_CATALOG AS DATABASE_NAME,
+            FUNCTION_SCHEMA AS SCHEMA_NAME,
+            FUNCTION_NAME,
+            FUNCTION_LANGUAGE,
+            IS_SECURE,
+            IS_EXTERNAL,
+            CREATED,
+            LAST_ALTERED
+        FROM SNOWFLAKE.ACCOUNT_USAGE.FUNCTIONS
+        WHERE DELETED IS NULL
+            AND FUNCTION_SCHEMA != 'INFORMATION_SCHEMA'
+        ORDER BY LAST_ALTERED DESC
+        LIMIT 500
+        """
+        return _self.session.sql(query).to_pandas()
+
+    @st.cache_data(ttl=3600)
+    def get_procedures_inventory(_self):
+        """Get inventory of stored procedures"""
+        query = """
+        SELECT
+            PROCEDURE_CATALOG AS DATABASE_NAME,
+            PROCEDURE_SCHEMA AS SCHEMA_NAME,
+            PROCEDURE_NAME,
+            PROCEDURE_LANGUAGE,
+            IS_SECURE,
+            CREATED,
+            LAST_ALTERED
+        FROM SNOWFLAKE.ACCOUNT_USAGE.PROCEDURES
+        WHERE DELETED IS NULL
+            AND PROCEDURE_SCHEMA != 'INFORMATION_SCHEMA'
+        ORDER BY LAST_ALTERED DESC
+        LIMIT 500
+        """
+        return _self.session.sql(query).to_pandas()
+
+    # -------------------------------------------------------------------------
+    # HYBRID TABLES & ADVANCED FEATURES
+    # -------------------------------------------------------------------------
+
+    @st.cache_data(ttl=3600)
+    def get_hybrid_table_usage(_self, days):
+        """Monitor hybrid table usage and costs"""
+        query = f"""
+        SELECT
+            DATABASE_NAME,
+            SCHEMA_NAME,
+            TABLE_NAME,
+            DATE_TRUNC('DAY', USAGE_DATE) AS USAGE_DATE,
+            SUM(AVERAGE_ROWS_STORED) AS AVG_ROWS,
+            SUM(AVERAGE_DATABASE_BYTES) AS AVG_BYTES,
+            SUM(CREDITS_USED_COMPUTE) AS COMPUTE_CREDITS,
+            SUM(CREDITS_USED_CLOUD_SERVICES) AS CLOUD_SERVICES_CREDITS
+        FROM SNOWFLAKE.ACCOUNT_USAGE.HYBRID_TABLE_USAGE_HISTORY
+        WHERE USAGE_DATE >= DATEADD(DAY, -{days}, CURRENT_DATE())
+        GROUP BY DATABASE_NAME, SCHEMA_NAME, TABLE_NAME, USAGE_DATE
+        ORDER BY COMPUTE_CREDITS DESC
+        LIMIT 100
+        """
+        return _self.session.sql(query).to_pandas()
+
+    # -------------------------------------------------------------------------
+    # AGGREGATE QUERY HISTORY (Performance Optimized)
+    # -------------------------------------------------------------------------
+
+    @st.cache_data(ttl=3600)
+    def get_aggregate_query_metrics(_self, days):
+        """Get pre-aggregated query metrics for faster performance"""
+        query = f"""
+        SELECT
+            DATE_TRUNC('HOUR', START_TIME) AS QUERY_HOUR,
+            WAREHOUSE_NAME,
+            USER_NAME,
+            QUERY_TYPE,
+            COUNT(*) AS QUERY_COUNT,
+            SUM(EXECUTION_TIME) / 1000 AS TOTAL_EXECUTION_SEC,
+            AVG(EXECUTION_TIME) / 1000 AS AVG_EXECUTION_SEC,
+            SUM(BYTES_SCANNED) AS TOTAL_BYTES_SCANNED,
+            SUM(CREDITS_USED_CLOUD_SERVICES) AS CLOUD_SERVICES_CREDITS
+        FROM SNOWFLAKE.ACCOUNT_USAGE.AGGREGATE_QUERY_HISTORY
+        WHERE START_TIME >= DATEADD(DAY, -{days}, CURRENT_DATE())
+        GROUP BY QUERY_HOUR, WAREHOUSE_NAME, USER_NAME, QUERY_TYPE
+        ORDER BY QUERY_HOUR DESC, QUERY_COUNT DESC
+        LIMIT 1000
         """
         return _self.session.sql(query).to_pandas()
 
@@ -531,9 +865,17 @@ class AIInsightsGenerator:
     def check_cortex_availability(self):
         """Check if Cortex Complete is available"""
         try:
-            result = self.session.sql("SELECT SYSTEM$CORTEX_AVAILABLE('COMPLETE')").collect()
-            return result[0][0] if result else False
-        except:
+            # Try to call Cortex Complete with a simple test
+            test_query = """
+            SELECT SNOWFLAKE.CORTEX.COMPLETE(
+                'mistral-7b',
+                'Test'
+            ) AS test_response
+            """
+            result = self.session.sql(test_query).collect()
+            return True
+        except Exception as e:
+            # Cortex not available or not authorized
             return False
 
     def generate_insight(self, context_data, insight_type="summary", custom_prompt=None):
