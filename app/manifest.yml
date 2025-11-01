@@ -1,0 +1,44 @@
+manifest_version: 1
+
+version:
+  name: V1_0
+  label: "1.0"
+  comment: "Initial release of Snowflake Holistic Observability Dashboard"
+
+artifacts:
+  setup_script: setup_script.sql
+  readme: README.md
+  default_streamlit: streamlit/main.py
+
+configuration:
+  log_level: INFO
+  trace_level: OFF
+
+privileges:
+  - IMPORTED PRIVILEGES:
+      description: "Required to access SNOWFLAKE.ACCOUNT_USAGE views for observability metrics"
+  - CREATE DATABASE:
+      description: "Required to create application database and schemas"
+  - EXECUTE TASK:
+      description: "Optional: For scheduling automated reports and alerts"
+
+references:
+  - SNOWFLAKE.ACCOUNT_USAGE.*:
+      label: "Account Usage Views"
+      description: "Access to Account Usage views for comprehensive observability metrics including warehouse metering, storage usage, query history, and security audit logs"
+      privileges:
+        - USAGE
+        - SELECT
+
+  - SNOWFLAKE.CORTEX:
+      label: "Snowflake Cortex"
+      description: "Access to Cortex AI services for generating intelligent insights and recommendations"
+      privileges:
+        - USAGE
+
+# Application metadata
+metadata:
+  warehouse_types: ["Standard", "Snowpark-optimized"]
+
+# Optional: Define application-specific configuration parameters
+# that can be set during installation
